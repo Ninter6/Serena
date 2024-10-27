@@ -10,15 +10,23 @@
 
 #include "mathpls.h"
 
+#include <span>
 #include <string>
 #include <memory>
+#include <numeric>
 #include <cstdint>
 #include <cassert>
 #include <algorithm>
 
 namespace st {
 
-#define SERENA_GLSL_VERSION "#version 410 core"
+#define STR(x) #x
+#define XSTR(x) STR(x)
+
+#define SERENA_OPENGL_VERSION_MAJOR 4
+#define SERENA_OPENGL_VERSION_MINOR 1
+#define SERENA_GLSL_VERSION \
+    "#version " XSTR(SERENA_OPENGL_VERSION_MAJOR) XSTR(SERENA_OPENGL_VERSION_MINOR) "0 core"
 
 using extent = mathpls::ivec2;
 
@@ -39,6 +47,7 @@ struct serena_global_context {
 
     // shaders
     GLuint simple_sh{};
+    GLuint polygon_sh{};
     GLuint tile_circle_sh{};
     GLuint tile_rect_sh{};
 };
@@ -48,8 +57,8 @@ namespace detail {
 
 inline void init_glfw_window(const char* title, int width, int height, bool msaa_enable = false) {
     glfwInit();
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, SERENA_OPENGL_VERSION_MAJOR);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, SERENA_OPENGL_VERSION_MINOR);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     if (msaa_enable) glfwWindowHint(GLFW_SAMPLES, 4);
 
@@ -118,7 +127,7 @@ layout (std140) uniform UBO { // default binding to 0
 };
 mat3 view = mat3( cos(cam_rotate)/cam_half_extent.x,-sin(cam_rotate)/cam_half_extent.y, 0,
                   sin(cam_rotate)/cam_half_extent.x, cos(cam_rotate)/cam_half_extent.y, 0,
-                 -cam_centre.x,                     -cam_centre.y,                      0 );
+                 -dot(vec2(cos(cam_rotate), sin(cam_rotate)), cam_centre)/cam_half_extent.x, dot(vec2(sin(cam_rotate),-cos(cam_rotate)), cam_centre)/cam_half_extent.y, 0 );
 void main() {
     float t = float(tile) / tile_count.x;
     frag_uv = uv / tile_count + vec2(fract(t), floor(t) / tile_count.y);
@@ -139,6 +148,20 @@ uniform sampler2D nboard; // default binding to 0
 uniform sampler2D lboard;
 void main() {
     color = mix(texture(nboard, frag_uv), texture(lboard, frag_uv), frag_spl) * frag_color;
+})";
+
+constexpr auto polygon_vsh = SERENA_GLSL_VERSION R"(
+layout (location = 0) in vec2 pos;
+uniform mat3 M;
+void main() {
+    gl_Position = vec4(M * vec3(pos, 1), 1);
+})";
+
+constexpr auto polygon_fsh = SERENA_GLSL_VERSION R"(
+uniform vec4 color;
+out vec4 out_color;
+void main () {
+    out_color = color;
 })";
 
 constexpr auto rect_vsh = SERENA_GLSL_VERSION R"(
@@ -174,6 +197,7 @@ inline void init_shader() {
     glUseProgram(global_context->simple_sh);
     glUniform1i(glGetUniformLocation(global_context->simple_sh, "lboard"), 1);
 
+    global_context->polygon_sh = compile_shader(polygon_vsh, polygon_fsh);
     global_context->tile_circle_sh = compile_shader(rect_vsh, tile_circle_fsh);
     global_context->tile_rect_sh = compile_shader(rect_vsh, tile_rect_fsh);
 }
@@ -226,6 +250,18 @@ inline void bind_unit_attr(GLuint vbo) {
     glVertexAttribPointer(7, 1, GL_FLOAT, false, sizeof(unit), (void*)offsetof(unit, sampler));
     glVertexAttribDivisor(7, 1);
     glEnableVertexAttribArray(7);
+}
+
+inline std::pair<GLuint, GLuint> create_polygon_mesh(const void* data, size_t size) {
+    GLuint vao, vbo;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)size, data, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, false, 2*sizeof(float), nullptr);
+    glEnableVertexAttribArray(0);
+    return {vao, vbo};
 }
 
 constexpr size_t min_unit_size = 256;
@@ -295,7 +331,8 @@ public:
         return mapped[n];
     }
 
-    void emplace_back(auto&&...args) {
+    template <class...Args>
+    void emplace_back(Args&&...args) {
         assert(size() <= capacity());
         if (size() == capacity())
             reserve(size()<<1);
@@ -535,6 +572,38 @@ public:
         tile_draw_rectangle(id, 1, clear_color);
     }
 
+    void tile_draw_polygon(tile id, std::span<const mathpls::vec2> points, const mathpls::vec4& color) {
+        assert(points.size() > 2);
+        auto [pvao, pvbo] = detail::create_polygon_mesh(points.data(), points.size()*sizeof(mathpls::vec2));
+
+        mathpls::vec2 mn{}, mx{};
+        for (auto&& i : points) {
+            mn.x = std::min(i.x, mn.x);
+            mn.y = std::min(i.y, mn.y);
+            mx.x = std::max(i.x, mx.x);
+            mx.y = std::max(i.y, mx.y);
+        }
+        auto C = (mn + mx) * .5f;
+        auto E = mx - C;
+        auto S = std::max(E.x, E.y);
+        mathpls::mat3 M = {
+            mathpls::vec3{1/S, 0, 0},
+            mathpls::vec3{0, 1/S, 0},
+            mathpls::vec3{-C.x/S, -C.y/S, 0}
+        };
+
+        tile_viewport(id);
+        glBindFramebuffer(GL_FRAMEBUFFER, board_fbo);
+        glUseProgram(global_context->polygon_sh);
+        glUniformMatrix3fv(glGetUniformLocation(global_context->polygon_sh, "M"), 1, false, M.value_ptr());
+        glUniform4fv(glGetUniformLocation(global_context->polygon_sh, "color"),1 , color.value_ptr());
+        glBindVertexArray(pvao);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, (GLsizei)points.size());
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteBuffers(1, &pvbo);
+        glDeleteVertexArrays(1, &pvao);
+    }
+
     void tile_draw_circle(tile id, const mathpls::vec4& color) const {
         tile_viewport(id);
         glBindFramebuffer(GL_FRAMEBUFFER, board_fbo);
@@ -573,5 +642,8 @@ private:
 };
 
 }
+
+#undef STR
+#undef XSTR
 
 #endif //SERENA_HPP
