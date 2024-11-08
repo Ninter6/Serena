@@ -10,13 +10,16 @@
 
 #include "mathpls.h"
 
+#include <set>
 #include <span>
 #include <string>
 #include <memory>
+#include <vector>
 #include <numeric>
 #include <cstdint>
 #include <cassert>
 #include <algorithm>
+#include <unordered_map>
 
 namespace st {
 
@@ -31,6 +34,8 @@ namespace st {
 using extent = mathpls::ivec2;
 
 using tile = uint32_t;
+
+constexpr tile null_tile = UINT32_MAX;
 
 struct serena_global_context {
     GLFWwindow* window{};
@@ -47,6 +52,7 @@ struct serena_global_context {
 
     // shaders
     GLuint simple_sh{};
+    GLuint stupid_sh{};
     GLuint polygon_sh{};
     GLuint tile_circle_sh{};
     GLuint tile_rect_sh{};
@@ -54,6 +60,312 @@ struct serena_global_context {
 inline serena_global_context* global_context = nullptr;
 
 namespace detail {
+
+template <class First, class Second>
+struct basic_compressed_pair : First, Second {
+    basic_compressed_pair() = default;
+    basic_compressed_pair(First&& f, Second&& s) : First(std::forward<First>(f)), Second(std::forward<Second>(s)) {}
+
+    [[nodiscard]] First& first() { return *this; }
+    [[nodiscard]] const First& first() const { return *this; }
+    [[nodiscard]] Second& second() { return *this; }
+    [[nodiscard]] const Second& second() const { return *this; }
+};
+
+template <class First, class Second>
+struct compressed_pair : private basic_compressed_pair<First, Second> {
+    using basic_compressed_pair<First, Second>::basic_compressed_pair;
+    using basic_compressed_pair<First, Second>::first;
+    using basic_compressed_pair<First, Second>::second;
+};
+
+template <class T, class Deref, class Res = std::invoke_result_t<Deref, typename std::vector<T>::const_iterator>>
+class dense_set_it_warp {
+public:
+    using iterator_category = std::random_access_iterator_tag;
+    using difference_type = std::ptrdiff_t;
+    using value_type = std::remove_reference_t<Res>;
+    using pointer = std::remove_reference_t<Res>*;
+    using reference = std::remove_reference_t<Res>&;
+
+    explicit dense_set_it_warp(typename std::vector<T>::const_iterator it) : it_(it) {}
+
+    Res operator*() const { static Deref d{}; return d(it_); }
+
+    dense_set_it_warp& operator++() { return ++it_, *this; }
+
+    dense_set_it_warp operator++(int) {
+        dense_set_it_warp tmp = *this;
+        return ++(*this), tmp;
+    }
+
+    dense_set_it_warp& operator--() { return --it_, *this; }
+
+    dense_set_it_warp operator--(int) {
+        dense_set_it_warp tmp = *this;
+        return --(*this), tmp;
+    }
+
+    dense_set_it_warp& operator+=(difference_type n) {
+        it_ += n;
+        return *this;
+    }
+
+    dense_set_it_warp operator+(difference_type n) const {
+        return dense_set_it_warp(it_ + n);
+    }
+
+    dense_set_it_warp& operator-=(difference_type n) {
+        it_ -= n;
+        return *this;
+    }
+
+    dense_set_it_warp operator-(difference_type n) const {
+        return dense_set_it_warp(it_ - n);
+    }
+
+    difference_type operator-(const dense_set_it_warp& other) const {
+        return it_ - other.it_;
+    }
+
+    bool operator==(const dense_set_it_warp& other) const {
+        return it_ == other.it_;
+    }
+
+    bool operator!=(const dense_set_it_warp& other) const {
+        return it_ != other.it_;
+    }
+
+    bool operator<(const dense_set_it_warp& other) const {
+        return it_ < other.it_;
+    }
+
+    bool operator<=(const dense_set_it_warp& other) const {
+        return it_ <= other.it_;
+    }
+
+    bool operator>(const dense_set_it_warp& other) const {
+        return it_ > other.it_;
+    }
+
+    bool operator>=(const dense_set_it_warp& other) const {
+        return it_ >= other.it_;
+    }
+
+private:
+    typename std::vector<T>::const_iterator it_;
+};
+
+template <class T, class Hash = std::hash<T>, class Eq = std::equal_to<T>, class Alloc = std::allocator<T>>
+class dense_set {
+    static constexpr size_t null_index = SIZE_T_MAX;
+    static constexpr float hash_k = .707f;
+
+    struct node_t {
+        template <class...Args>
+        explicit node_t(Args&&...args) : value{std::forward<Args>(args)...} {}
+        T value;
+        size_t next = null_index;
+    };
+
+    using alloc_traits = std::allocator_traits<Alloc>;
+    using sparse_container = std::vector<size_t, typename alloc_traits::template rebind_alloc<size_t>>;
+    using packed_container = std::vector<node_t, typename alloc_traits::template rebind_alloc<node_t>>;
+
+    struct node_deref { const T& operator()(const typename packed_container::const_iterator& it) const {
+        return it->value;
+    }};
+
+    [[nodiscard]] auto index_to_iterator(size_t index)  { return begin() + index; }
+    [[nodiscard]] auto index_to_iterator(size_t index) const { return cbegin() + index; }
+
+    [[nodiscard]] size_t hash(size_t i) const { return sparse_.second()(packed_.first()[i].value); }
+    void set_hash(size_t hash, size_t index) {
+        assert(sparse_.first().size() > 0);
+        hash %= sparse_.first().size();
+        sparse_.first()[hash] = index;
+    }
+
+    template <class...Args>
+    void emplace_back(Args&&...args) {
+        packed_.first().emplace_back(std::forward<Args>(args)...);
+        length_++;
+    }
+    template <class...Args>
+    void replace_back(Args&&...args) {
+        packed_.first()[length_++] = node_t{std::forward<Args>(args)...};
+    }
+
+    [[nodiscard]] size_t hash_list_back(size_t hash) const {
+        hash %= sparse_.first().size();
+        size_t back = sparse_.first()[hash];
+        if (back != null_index)
+            while (packed_.first()[back].next != null_index)
+                back = packed_.first()[back].next;
+        return back;
+    }
+    [[nodiscard]] size_t hash_list_pre(size_t index) const {
+        auto hash = this->hash(index) % sparse_.first().size();
+        size_t pre = sparse_.first()[hash];
+        if (pre != index)
+            while (packed_.first()[pre].next != index)
+                assert(pre != null_index), pre = packed_.first()[pre].next;
+        return pre;
+    }
+
+    void rehash() {
+        sparse_.first().assign(static_cast<size_t>(length_ * 2 / hash_k), null_index);
+        for (size_t i = 0; i < length_; i++)
+            sparse_emplace(i);
+    }
+
+    // need: false, needn't: true
+    bool rehash_if_need() {
+        if (length_ < sparse_.first().size() * hash_k)
+            return true;
+        rehash();
+        return false;
+    }
+
+    void sparse_emplace(size_t id) {
+        auto hs = hash(id);
+        if (auto back = hash_list_back(hs); back == null_index) {
+            set_hash(hs, id);
+            packed_.first()[id].next = null_index;
+        } else {
+            packed_.first()[back].next = id;
+        }
+    }
+
+    void isolate(size_t index) {
+        auto pre = hash_list_pre(index);
+        assert(pre != null_index);
+        if (pre == index)
+            set_hash(hash(index), null_index);
+        else
+            packed_.first()[pre].next = packed_.first()[index].next;
+        packed_.first()[index].next = null_index;
+    }
+
+    void swap_only(size_t index) {
+        isolate(index);
+        if (index != --length_) {
+            auto pre = hash_list_pre(length_);
+            assert(pre != null_index);
+            if (pre == length_) set_hash(hash(length_), index);
+            else packed_.first()[pre].next = index;
+            std::swap(packed_.first()[index], packed_.first()[length_]);
+        }
+    }
+
+    [[nodiscard]] size_t find_index(const T& key) const {
+        auto hs = sparse_.second()(key) % sparse_.first().size();
+        auto i = sparse_.first()[hs];
+        while (i != null_index && !packed_.second()(packed_.first()[i].value, key))
+            i = packed_.first()[i].next;
+        return i;
+    }
+
+public:
+    using iterator = dense_set_it_warp<node_t, node_deref>;
+    using const_iterator = iterator;
+
+    dense_set() = default;
+
+    [[nodiscard]] size_t size() const { return length_; }
+    [[nodiscard]] size_t free_size() const { return packed_.first().size() - length_; }
+    [[nodiscard]] bool empty() const { return length_ == 0; }
+
+    [[nodiscard]] size_t capacity() const { return packed_.first().capacity(); }
+    void reserve(size_t n) { packed_.first().reserve(n); }
+
+    template <class...Args>
+    iterator emplace(Args&&...args) {
+        size_t index = length_;
+        if (free_size() == 0) {
+            emplace_back(std::forward<Args>(args)...);
+        } else {
+            replace_back(std::forward<Args>(args)...);
+        }
+
+        if (rehash_if_need())
+            sparse_emplace(index);
+
+        return index_to_iterator(index);
+    }
+
+    iterator push(const T& v) { return emplace(v); }
+
+    void erase(iterator it) {
+        auto index = std::distance(begin(), it);
+        assert(index < length_);
+        swap_only(index);
+    }
+
+    void erase(iterator first, iterator last) {
+        assert(first <= last);
+        while (last != first) erase(--last);
+    }
+
+    void erase(const T& key) {
+        if (auto it = find(key); it != end())
+            erase(it);
+    }
+
+    void pop_back() { erase(index_to_iterator(length_ - 1)); }
+
+    void clear() {
+        std::uninitialized_fill(sparse_.first().begin(), sparse_.first().end(), null_index);
+        length_ = 0;
+    }
+
+    void free_clear() {
+        packed_.first().erase(packed_.first().begin() + length_, packed_.first().end());
+    }
+
+    void shrink_to_fit() {
+        free_clear();
+        packed_.first().shrink_to_fit();
+    }
+
+    const T& undo_pop() {
+        assert(free_size() > 0);
+        sparse_emplace(length_++);
+        return back();
+    }
+
+    [[nodiscard]] iterator find(const T& key) {
+        auto i = find_index(key);
+        return i == null_index ? end() : index_to_iterator(i);
+    }
+    [[nodiscard]] const_iterator find(const T& key) const {
+        auto i = find_index(key);
+        return i == null_index ? end() : index_to_iterator(i);
+    }
+
+    [[nodiscard]] bool contains(const T& key) const { return find(key) != end(); }
+
+    [[nodiscard]] const T& front() const { return packed_.first().front().value; }
+    [[nodiscard]] const T& back() const { return packed_.first()[length_ - 1].value; }
+
+    // [[nodiscard]] iterator begin() { return iterator{packed_.first().cbegin()}; }
+    // [[nodiscard]] iterator end() { return begin() + length_; }
+    [[nodiscard]] const_iterator begin() const { return const_iterator{packed_.first().cbegin()}; }
+    [[nodiscard]] const_iterator end() const { return begin() + length_; }
+    // [[nodiscard]] auto rbegin() { return std::make_reverse_iterator(end()); }
+    // [[nodiscard]] auto rend() { return std::make_reverse_iterator(begin()); }
+    [[nodiscard]] auto rbegin() const { return std::make_reverse_iterator(end());; }
+    [[nodiscard]] auto rend() const { return std::make_reverse_iterator(begin()); }
+    [[nodiscard]] const_iterator cbegin() const { return begin(); }
+    [[nodiscard]] const_iterator cend() const { return end(); }
+    [[nodiscard]] auto crbegin() const { return rbegin(); }
+    [[nodiscard]] auto crend() const { return rend(); }
+
+private:
+    compressed_pair<sparse_container, Hash> sparse_;
+    compressed_pair<packed_container, Eq>   packed_;
+    size_t length_{};
+};
 
 inline void init_glfw_window(const char* title, int width, int height, bool msaa_enable = false) {
     glfwInit();
@@ -150,6 +462,35 @@ void main() {
     color = mix(texture(nboard, frag_uv), texture(lboard, frag_uv), frag_spl) * frag_color;
 })";
 
+constexpr auto stupid_vsh = SERENA_GLSL_VERSION R"(
+layout (location = 0) in vec2 vert;
+layout (location = 1) in vec2 uv;
+uniform uint tile;
+uniform vec4 color;
+uniform vec2 pos;
+uniform vec2 scale;
+uniform float rotate;
+uniform float spl;
+out vec2 frag_uv;
+flat out vec4 frag_color;
+flat out float frag_spl;
+layout (std140) uniform UBO { // default binding to 0
+    vec2 tile_count;
+    vec2 cam_centre;
+    vec2 cam_half_extent;
+    float cam_rotate;
+};
+void main() {
+    float t = float(tile) / tile_count.x;
+    frag_uv = uv / tile_count + vec2(fract(t), floor(t) / tile_count.y);
+    frag_color = color;
+    frag_spl = spl;
+    mat2 M = mat2( cos(rotate), sin(rotate),
+                  -sin(rotate), cos(rotate) );
+    vec2 p = M * ((vert * 2 - 1) * scale) + pos;
+    gl_Position = vec4(p, 0, 1);
+})";
+
 constexpr auto polygon_vsh = SERENA_GLSL_VERSION R"(
 layout (location = 0) in vec2 pos;
 uniform mat3 M;
@@ -196,6 +537,9 @@ inline void init_shader() {
     global_context->simple_sh = compile_shader(simple_vsh, simple_fsh);
     glUseProgram(global_context->simple_sh);
     glUniform1i(glGetUniformLocation(global_context->simple_sh, "lboard"), 1);
+    global_context->stupid_sh = compile_shader(stupid_vsh, simple_fsh);
+    glUseProgram(global_context->stupid_sh);
+    glUniform1i(glGetUniformLocation(global_context->stupid_sh, "lboard"), 1);
 
     global_context->polygon_sh = compile_shader(polygon_vsh, polygon_fsh);
     global_context->tile_circle_sh = compile_shader(rect_vsh, tile_circle_fsh);
@@ -441,7 +785,7 @@ struct camera {
     float rotate{};
 };
 
-class drawer {
+class draw_board {
     void init() {
         init_board();
         init_fbo();
@@ -466,9 +810,6 @@ class drawer {
         glGenFramebuffers(1, &board_fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, board_fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, board_tex, 0);
-
-        constexpr GLenum draw_buffers[] = { GL_COLOR_ATTACHMENT0 };
-        glDrawBuffers(1, draw_buffers);
 
         assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -510,16 +851,16 @@ class drawer {
     }
 
 public:
-    explicit drawer(extent board_size = 8192, extent tile_size = 256)
+    explicit draw_board(extent board_size = 8192, extent tile_size = 256)
         : board_size(board_size), tile_size(tile_size) {
         assert(global_context && "init window first");
         assert(board_size.x % tile_size.x == 0 && board_size.y % tile_size.y == 0);
         init();
     }
 
-    drawer(drawer&&) = delete;
+    draw_board(draw_board&&) = delete;
 
-    ~drawer() {
+    ~draw_board() {
         glDeleteFramebuffers(1, &board_fbo);
         glDeleteTextures(1, &board_tex);
         glDeleteVertexArrays(1, &vao);
@@ -529,7 +870,8 @@ public:
     }
 
     tile create() {
-        return curr_tile++;
+        auto [x, y] = (board_size / tile_size).asArray;
+        return curr_tile < x*y ? curr_tile++ : null_tile;
     }
 
     void set_camera(const camera& cam) {
@@ -538,9 +880,9 @@ public:
         ubo_mapped->rotate = cam.rotate;
     }
 
-    void draw(tile id, const transform& t, const material& material = {}) const {
+    void draw(tile id, const transform& t, const material& m = {}) const {
         auto& [pos, scale, rotate] = t;
-        auto& [color, sampler] = material;
+        auto& [color, sampler] = m;
         units->emplace_back(id, color, (float)sampler, pos, scale, rotate);
     }
 
@@ -572,7 +914,80 @@ public:
         tile_draw_rectangle(id, 1, clear_color);
     }
 
-    void tile_draw_polygon(tile id, std::span<const mathpls::vec2> points, const mathpls::vec4& color) {
+    void tile_image(tile id, extent image_size, int channel, uint8_t* data) {
+        GLenum format = GL_RGBA;
+        auto [x, y] = tile_offset(id).asArray;
+        switch (channel) {
+            case 1: format = GL_RED; break;
+            case 2: format = GL_RG; break;
+            case 3: format = GL_RGB; break;
+            case 4: format = GL_RGBA; break;
+            default: assert(false);
+        }
+        if (image_size == tile_size) {
+            glBindTexture(GL_TEXTURE_2D, board_tex);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, image_size.x, image_size.y, format, GL_UNSIGNED_BYTE, data);
+        } else {
+            GLuint buf_tex;
+            glGenTextures(1, &buf_tex);
+            glBindTexture(GL_TEXTURE_2D, buf_tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, (GLint)format, image_size.x, image_size.y, 0, format, GL_UNSIGNED_BYTE, data);
+
+            GLuint buf_fbo;
+            glGenFramebuffers(1, &buf_fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, buf_fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, buf_tex, 0);
+            assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, buf_fbo);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, board_fbo);
+            glBlitFramebuffer(0, 0, image_size.x, image_size.y,
+                              x, y,x+tile_size.x,y+tile_size.y,
+                              GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+            glDeleteFramebuffers(1, &buf_fbo);
+            glDeleteTextures(1, &buf_tex);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+    }
+
+    void tile_draw_tile(tile dst, tile src) {
+        assert(dst != src);
+        auto [dx, dy] = tile_offset(dst).asArray;
+        auto [sx, sy] = tile_offset(src).asArray;
+        glBindFramebuffer(GL_FRAMEBUFFER, board_fbo);
+        glBindTexture(GL_TEXTURE_2D, board_tex);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, dx, dy, sx, sy, tile_size.x, tile_size.y);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    void tile_draw_tile(tile dst, tile src, const transform& t, const material& m = {}) {
+        tile_viewport(dst);
+        glEnable(GL_BLEND);
+        glBindFramebuffer(GL_FRAMEBUFFER, board_fbo);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, board_tex);
+        glBindSampler(0, global_context->nearest_sampler);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, board_tex);
+        glBindSampler(1, global_context->linear_sampler);
+        glBindVertexArray(vao);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+        glUseProgram(global_context->stupid_sh);
+        glUniform1ui(glGetUniformLocation(global_context->stupid_sh, "tile"), src);
+        glUniform2fv(glGetUniformLocation(global_context->stupid_sh, "pos"), 1, t.pos.value_ptr());
+        glUniform2fv(glGetUniformLocation(global_context->stupid_sh, "scale"), 1, t.scale.value_ptr());
+        glUniform1f(glGetUniformLocation(global_context->stupid_sh, "rotate"), t.rotate);
+        glUniform1f(glGetUniformLocation(global_context->stupid_sh, "spl"), (float)m.sampler);
+        glUniform4fv(glGetUniformLocation(global_context->stupid_sh, "color"), 1, m.color.value_ptr());
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glBindSampler(0, 0);
+        glBindSampler(1, 0);
+        glDisable(GL_BLEND);
+    }
+
+    transform tile_draw_polygon(tile id, std::span<const mathpls::vec2> points, const mathpls::vec4& color) {
         assert(points.size() > 2);
         auto [pvao, pvbo] = detail::create_polygon_mesh(points.data(), points.size()*sizeof(mathpls::vec2));
 
@@ -585,11 +1000,10 @@ public:
         }
         auto C = (mn + mx) * .5f;
         auto E = mx - C;
-        auto S = std::max(E.x, E.y);
         mathpls::mat3 M = {
-            mathpls::vec3{1/S, 0, 0},
-            mathpls::vec3{0, 1/S, 0},
-            mathpls::vec3{-C.x/S, -C.y/S, 0}
+            mathpls::vec3{1/E.x, 0, 0},
+            mathpls::vec3{0, 1/E.y, 0},
+            mathpls::vec3{-C.x/E.x, -C.y/E.y, 0}
         };
 
         tile_viewport(id);
@@ -602,6 +1016,8 @@ public:
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glDeleteBuffers(1, &pvbo);
         glDeleteVertexArrays(1, &pvao);
+
+        return { .pos = C, .scale = E };
     }
 
     void tile_draw_circle(tile id, const mathpls::vec4& color) const {
@@ -625,6 +1041,12 @@ public:
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
+    void clear_all_tiles() const {
+        glBindFramebuffer(GL_FRAMEBUFFER, board_fbo);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
 private:
     GLuint board_tex{};
     extent board_size{};
@@ -639,6 +1061,120 @@ private:
     GLuint vao{};
 
     tile curr_tile = 0;
+};
+
+class drawer {
+public:
+    drawer(extent board_size, extent tile_size) {
+        board = std::make_unique<draw_board>(board_size, tile_size);
+        auto [x, y] = (board_size / tile_size).asArray;
+        max_tile_size = x*y;
+    }
+
+    tile create(const std::string& name) {
+        names.push(name);
+        if (ids.free_size() > 0)
+            return ids.undo_pop();
+        else {
+            auto id = board->create();
+            assert(id != null_tile);
+            ids.push(id);
+            return id;
+        }
+    }
+
+    void destroy(const std::string& name) {
+        destroy(get_id(name));
+    }
+    void destroy(tile id) {
+        board->tile_clear(id);
+        const auto index = std::distance(ids.begin(), ids.find(id));
+        ids.erase(ids.begin() + index);
+        names.erase(names.begin() + index);
+    }
+
+    [[nodiscard]] std::string get_name(tile id) const {
+        const auto index = std::distance(ids.begin(), ids.find(id));
+        return *(names.begin() + index);
+    }
+    [[nodiscard]] tile get_id(const std::string& name) const {
+        const auto index = std::distance(names.begin(), names.find(name));
+        return *(ids.begin() + index);
+    }
+
+    void rename(tile id, const std::string& new_name) {
+        const auto index = std::distance(ids.begin(), ids.find(id));
+        ids.erase(ids.begin() + index);
+        names.erase(names.begin() + index);
+        create(new_name);
+    }
+    void rename(const std::string& name, const std::string& new_name) {
+        const auto index = std::distance(names.begin(), names.find(name));
+        ids.erase(ids.begin() + index);
+        names.erase(names.begin() + index);
+        create(new_name);
+    }
+
+    [[nodiscard]] bool exist(const std::string& name) const {
+        return names.contains(name);
+    }
+
+    [[nodiscard]] size_t size() const {
+        return ids.size();
+    }
+    [[nodiscard]] size_t remain() const {
+        return max_tile_size - ids.size();
+    }
+
+    void clear() {
+        ids.clear();
+        names.clear();
+        board->clear_all_tiles();
+    }
+
+    void draw_polygon(tile buf_tile, std::span<const mathpls::vec2> points, const material& m) {
+        const auto& t = board->tile_draw_polygon(buf_tile, points, m.color);
+        draw_tile(buf_tile, t, {.sampler = m.sampler});
+    }
+    void draw_polygon(const std::string& name, std::span<const mathpls::vec2> points, const material& m) {
+        draw_polygon(get_id(name), points, m);
+    }
+
+    void set_camera(const camera& cam) { board->set_camera(cam); }
+
+    void submit() const { board->submit(); }
+    void submit_without_clear() const { board->submit_without_clear(); }
+
+    void draw_tile(tile id, const transform& t, const material& m = {}) { board->draw(id, t, m); }
+    void draw_tile(const std::string& name, const transform& t, const material& m = {}) { board->draw(get_id(name), t, m); }
+
+    void tile_clear(tile id) { board->tile_clear(id); }
+    void tile_clear(const std::string& name) { board->tile_clear(get_id(name)); }
+
+    void tile_image(tile id, extent image_size, int channel, uint8_t* data) { board->tile_image(id, image_size, channel, data); }
+    void tile_image(const std::string& name, extent image_size, int channel, uint8_t* data) { board->tile_image(get_id(name), image_size, channel, data); }
+
+    void tile_draw_tile(tile dst, tile src) { board->tile_draw_tile(dst, src); }
+    void tile_draw_tile(const std::string& dst, const std::string& src) { board->tile_draw_tile(get_id(dst), get_id(src)); }
+    void tile_draw_tile(tile dst, tile src, const transform& t, const material& m = {}) { board->tile_draw_tile(dst, src, t, m); }
+    void tile_draw_tile(const std::string& dst, const std::string& src, const transform& t, const material& m = {}) { board->tile_draw_tile(get_id(dst), get_id(src), t, m); }
+
+    void tile_draw_polygon(tile id, std::span<const mathpls::vec2> points, const mathpls::vec4& color) { board->tile_draw_polygon(id, points, color); }
+    void tile_draw_polygon(const std::string& name, std::span<const mathpls::vec2> points, const mathpls::vec4& color) { board->tile_draw_polygon(get_id(name), points, color); }
+
+    void tile_draw_circle(tile id, const mathpls::vec4& color) { board->tile_draw_circle(id, color); }
+    void tile_draw_circle(const std::string& name, const mathpls::vec4& color) { board->tile_draw_circle(get_id(name), color); }
+
+    void tile_draw_rectangle(tile id, float w_h, const mathpls::vec4& color) { board->tile_draw_rectangle(id, w_h, color); }
+    void tile_draw_rectangle(const std::string& name, float w_h, const mathpls::vec4& color) { board->tile_draw_rectangle(get_id(name), w_h, color); }
+
+private:
+    std::unique_ptr<draw_board> board;
+
+    size_t max_tile_size;
+
+    detail::dense_set<tile> ids;
+    detail::dense_set<std::string> names;
 };
 
 }
