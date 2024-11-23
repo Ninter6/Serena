@@ -37,9 +37,89 @@ using tile = uint32_t;
 
 constexpr tile null_tile = UINT32_MAX;
 
+class mouse_manager {
+private:
+    static constexpr int mouse_button_last = 3;
+    // 0: left mouse
+    // 1: right mouse
+    // 2: middle mouse
+
+    bool button_states[mouse_button_last]{};
+    bool button_pressed[mouse_button_last]{};
+    bool button_released[mouse_button_last]{};
+    double last_press_time[mouse_button_last]{};
+    mathpls::dvec2 drag_start_positions[mouse_button_last]{};
+    mathpls::dvec2 current_position{};
+    double current_time{};
+
+public:
+    mouse_manager() = default;
+
+    void update(GLFWwindow* window) {
+        current_time = glfwGetTime();
+        // 更新鼠标按键状态
+        for (int i = 0; i < mouse_button_last; ++i) {
+            if (glfwGetMouseButton(window, i) == GLFW_PRESS) {
+                if (!button_states[i]) {
+                    button_states[i] = true;
+                    button_pressed[i] = true;
+                    last_press_time[i] = current_time;
+                    drag_start_positions[i] = current_position;
+                } else {
+                    button_pressed[i] = false;
+                }
+            } else {
+                if (button_states[i]) {
+                    button_states[i] = false;
+                    button_released[i] = true;
+                } else {
+                    button_released[i] = false;
+                }
+            }
+        }
+
+        mathpls::ivec2 window_size;
+        glfwGetCursorPos(window, &current_position.x, &current_position.y);
+        glfwGetWindowSize(window, &window_size.x, &window_size.y);
+        current_position /= (mathpls::dvec2)window_size;
+    }
+
+    bool is_button_pressed(int button) {
+        return button_pressed[button];
+    }
+
+    bool is_button_released(int button) {
+        return button_released[button];
+    }
+
+    bool is_button_down(int button) {
+        return button_states[button];
+    }
+
+    bool is_button_long_pressed(int button, double long_press_duration = 0.5) {
+        return button_states[button] && (current_time - last_press_time[button] >= long_press_duration);
+    }
+
+    mathpls::dvec2 get_position() {
+        return current_position;
+    }
+
+    mathpls::dvec2 get_drag_start_position(int button) {
+        return drag_start_positions[button];
+    }
+
+    void reset_button_state(int button) {
+        button_states[button] = false;
+        button_pressed[button] = false;
+        button_released[button] = false;
+    }
+};
+
 struct serena_global_context {
     GLFWwindow* window{};
     extent window_extent{};
+
+    mouse_manager mouse{};
 
     GLint max_texture_size{};
 
@@ -176,10 +256,10 @@ class dense_set {
         return it->value;
     }};
 
-    [[nodiscard]] auto index_to_iterator(size_t index)  { return begin() + index; }
+//    [[nodiscard]] auto index_to_iterator(size_t index)  { return begin() + index; }
     [[nodiscard]] auto index_to_iterator(size_t index) const { return cbegin() + index; }
 
-    [[nodiscard]] size_t hash(size_t i) const { return sparse_.second()(packed_.first()[i].value); }
+    [[nodiscard]] size_t hash_of(size_t i) const { return sparse_.second()(packed_.first()[i].value); }
     void set_hash(size_t hash, size_t index) {
         assert(sparse_.first().size() > 0);
         hash %= sparse_.first().size();
@@ -205,7 +285,7 @@ class dense_set {
         return back;
     }
     [[nodiscard]] size_t hash_list_pre(size_t index) const {
-        auto hash = this->hash(index) % sparse_.first().size();
+        auto hash = this->hash_of(index) % sparse_.first().size();
         size_t pre = sparse_.first()[hash];
         if (pre != index)
             while (packed_.first()[pre].next != index)
@@ -228,7 +308,7 @@ class dense_set {
     }
 
     void sparse_emplace(size_t id) {
-        auto hs = hash(id);
+        auto hs = hash_of(id);
         if (auto back = hash_list_back(hs); back == null_index) {
             set_hash(hs, id);
             packed_.first()[id].next = null_index;
@@ -241,7 +321,7 @@ class dense_set {
         auto pre = hash_list_pre(index);
         assert(pre != null_index);
         if (pre == index)
-            set_hash(hash(index), null_index);
+            set_hash(hash_of(index), packed_.first()[index].next);
         else
             packed_.first()[pre].next = packed_.first()[index].next;
         packed_.first()[index].next = null_index;
@@ -252,13 +332,14 @@ class dense_set {
         if (index != --length_) {
             auto pre = hash_list_pre(length_);
             assert(pre != null_index);
-            if (pre == length_) set_hash(hash(length_), index);
+            if (pre == length_) set_hash(hash_of(length_), index);
             else packed_.first()[pre].next = index;
             std::swap(packed_.first()[index], packed_.first()[length_]);
         }
     }
 
     [[nodiscard]] size_t find_index(const T& key) const {
+        if (sparse_.first().empty()) return null_index;
         auto hs = sparse_.second()(key) % sparse_.first().size();
         auto i = sparse_.first()[hs];
         while (i != null_index && !packed_.second()(packed_.first()[i].value, key))
@@ -297,6 +378,7 @@ public:
     iterator push(const T& v) { return emplace(v); }
 
     void erase(iterator it) {
+        if (it == end()) return;
         auto index = std::distance(begin(), it);
         assert(index < length_);
         swap_only(index);
@@ -354,7 +436,7 @@ public:
     [[nodiscard]] const_iterator end() const { return begin() + length_; }
     // [[nodiscard]] auto rbegin() { return std::make_reverse_iterator(end()); }
     // [[nodiscard]] auto rend() { return std::make_reverse_iterator(begin()); }
-    [[nodiscard]] auto rbegin() const { return std::make_reverse_iterator(end());; }
+    [[nodiscard]] auto rbegin() const { return std::make_reverse_iterator(end()); }
     [[nodiscard]] auto rend() const { return std::make_reverse_iterator(begin()); }
     [[nodiscard]] const_iterator cbegin() const { return begin(); }
     [[nodiscard]] const_iterator cend() const { return end(); }
@@ -734,7 +816,7 @@ inline void init_window(std::string_view title, extent window_size, bool msaa_en
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &global_context->max_texture_size);
-    std::clog << "Max Texture Size: " << global_context->max_texture_size << '\n';
+//    std::clog << "Max Texture Size: " << global_context->max_texture_size << '\n';
 
     constexpr float rect[] = { 0,0, 1,1, 1,0, 0,1, 1,1, 0,0 };
     glGenBuffers(1, &global_context->rect_vbo);
@@ -757,12 +839,37 @@ inline void window_close() {
 inline void next_frame() {
     glfwPollEvents();
     glfwSwapBuffers(global_context->window);
+    global_context->mouse.update(global_context->window);
 }
 
 inline void next_frame(mathpls::vec4 clear_color) {
     next_frame();
     glClearColor(clear_color[0], clear_color[1], clear_color[2], clear_color[3]);
     glClear(GL_COLOR_BUFFER_BIT);
+}
+
+inline bool is_mouse_button_down(int button) {
+    return global_context->mouse.is_button_down(button);
+}
+
+inline bool is_mouse_button_pressed(int button) {
+    return global_context->mouse.is_button_pressed(button);
+}
+
+inline bool is_mouse_button_released(int button) {
+    return global_context->mouse.is_button_released(button);
+}
+
+inline bool is_mouse_button_long_pressed(int button, double long_press_duration = 0.5) {
+    return global_context->mouse.is_button_long_pressed(button, long_press_duration);
+}
+
+inline mathpls::dvec2 get_mouse_pos() {
+    return global_context->mouse.get_position();
+}
+
+inline mathpls::dvec2 get_mouse_drag_start_pos(int button) {
+    return global_context->mouse.get_drag_start_position(button);
 }
 
 struct transform {
@@ -792,6 +899,7 @@ class draw_board {
         init_vao();
         init_ubo();
         units = std::make_unique<detail::unit_pool>(vao);
+        clear_all_tiles();
     }
 
     void init_board() {
@@ -830,7 +938,7 @@ class draw_board {
         glGenBuffers(1, &ubo);
         glBindBuffer(GL_UNIFORM_BUFFER, ubo);
         glBufferData(GL_UNIFORM_BUFFER, sizeof(detail::drawer_ubo), nullptr, GL_DYNAMIC_DRAW);
-        ubo_mapped = (detail::drawer_ubo*)glMapBuffer(GL_UNIFORM_BUFFER, GL_WRITE_ONLY);
+        ubo_mapped = (detail::drawer_ubo*)glMapBuffer(GL_UNIFORM_BUFFER, GL_READ_WRITE);
         ubo_mapped->tile_count = board_size / tile_size;
     }
 
@@ -880,6 +988,10 @@ public:
         ubo_mapped->rotate = cam.rotate;
     }
 
+    [[nodiscard]] camera get_camera() const {
+        return {ubo_mapped->centre, ubo_mapped->half_extent, ubo_mapped->rotate};
+    }
+
     void draw(tile id, const transform& t, const material& m = {}) const {
         auto& [pos, scale, rotate] = t;
         auto& [color, sampler] = m;
@@ -911,7 +1023,14 @@ public:
     }
 
     void tile_clear(tile id, const mathpls::vec4 clear_color = {}) {
-        tile_draw_rectangle(id, 1, clear_color);
+        auto [x, y] = tile_offset(id).asArray;
+        glBindFramebuffer(GL_FRAMEBUFFER, board_fbo);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(x, y, tile_size.x, tile_size.y);
+        glClearColor(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
     void tile_image(tile id, extent image_size, int channel, uint8_t* data) {
@@ -991,7 +1110,7 @@ public:
         assert(points.size() > 2);
         auto [pvao, pvbo] = detail::create_polygon_mesh(points.data(), points.size()*sizeof(mathpls::vec2));
 
-        mathpls::vec2 mn{}, mx{};
+        mathpls::vec2 mn{3.402823E38}, mx{-3.40282E38};
         for (auto&& i : points) {
             mn.x = std::min(i.x, mn.x);
             mn.y = std::min(i.y, mn.y);
@@ -1017,7 +1136,7 @@ public:
         glDeleteBuffers(1, &pvbo);
         glDeleteVertexArrays(1, &pvao);
 
-        return { .pos = C, .scale = E };
+        return { .pos = C, .scale = E*2 };
     }
 
     void tile_draw_circle(tile id, const mathpls::vec4& color) const {
@@ -1043,6 +1162,7 @@ public:
 
     void clear_all_tiles() const {
         glBindFramebuffer(GL_FRAMEBUFFER, board_fbo);
+        glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
@@ -1063,12 +1183,41 @@ private:
     tile curr_tile = 0;
 };
 
+struct auto_delete_flag_t {};
+constexpr auto_delete_flag_t auto_delete;
+
+enum mouse_mode {
+    world_space, screen_space
+};
+
 class drawer {
 public:
     drawer(extent board_size, extent tile_size) {
         board = std::make_unique<draw_board>(board_size, tile_size);
         auto [x, y] = (board_size / tile_size).asArray;
         max_tile_size = x*y;
+    }
+
+    [[nodiscard]] mathpls::dvec2 get_mouse_pos(mouse_mode mode) const {
+        auto c = st::get_mouse_pos();
+        switch (mode) {
+            case world_space:
+                c = (c * 2 - 1) * (mathpls::dvec2)board->get_camera().half_extent;
+                c.y *= -1;
+                return c;
+            case screen_space: return c; // from (0, 0) to (1, 1)
+        }
+    }
+
+    [[nodiscard]] mathpls::dvec2 get_drag_start_position(int button, mouse_mode mode) const {
+        auto c = get_mouse_drag_start_pos(button);
+        switch (mode) {
+            case world_space:
+                c = (c * 2 - 1) * (mathpls::dvec2)board->get_camera().half_extent;
+                c.y *= -1;
+                return c;
+            case screen_space: return c; // from (0, 0) to (1, 1)
+        }
     }
 
     tile create(const std::string& name) {
@@ -1082,11 +1231,17 @@ public:
             return id;
         }
     }
+    tile create(auto_delete_flag_t, const std::string& name = "__AUtO_dElEtE") {
+        auto id = create(name);
+        auto_delete_tiles.push_back(id);
+        return id;
+    }
 
     void destroy(const std::string& name) {
         destroy(get_id(name));
     }
     void destroy(tile id) {
+        assert(ids.contains(id));
         board->tile_clear(id);
         const auto index = std::distance(ids.begin(), ids.find(id));
         ids.erase(ids.begin() + index);
@@ -1094,10 +1249,12 @@ public:
     }
 
     [[nodiscard]] std::string get_name(tile id) const {
+        assert(ids.contains(id));
         const auto index = std::distance(ids.begin(), ids.find(id));
         return *(names.begin() + index);
     }
     [[nodiscard]] tile get_id(const std::string& name) const {
+        assert(names.contains(name));
         const auto index = std::distance(names.begin(), names.find(name));
         return *(ids.begin() + index);
     }
@@ -1130,20 +1287,48 @@ public:
         ids.clear();
         names.clear();
         board->clear_all_tiles();
+        auto_delete_tiles.clear();
+    }
+
+    void draw_line(tile buf_tile, mathpls::vec2 a, mathpls::vec2 b, float thickness, mathpls::vec4 color, bool clear_tile = true) {
+        if (clear_tile) board->tile_clear(buf_tile, {1});
+        auto [dx, dy] = (b - a).asArray;
+        board->draw(buf_tile, {
+            .pos = (a + b) * .5f,
+            .scale = { mathpls::distance(a, b), thickness },
+            .rotate = std::atan2(dy, dx)
+        }, { .color = color });
+    }
+    void draw_line(const std::string& buf_tile_name, mathpls::vec2 a, mathpls::vec2 b, float thickness, mathpls::vec4 color, bool clear_tile = true) {
+        draw_line(get_id(buf_tile_name), a, b, thickness, color, clear_tile);
+    }
+    void draw_line(mathpls::vec2 a, mathpls::vec2 b, float thickness, mathpls::vec4 color) {
+        if (exist("__AUtO_dElEtE_whItE_blOck"))
+            draw_line("__AUtO_dElEtE_whItE_blOck", a, b, thickness, color, false);
+        else
+            draw_line(create(auto_delete, "__AUtO_dElEtE_whItE_blOck"), a, b, thickness, color);
     }
 
     void draw_polygon(tile buf_tile, std::span<const mathpls::vec2> points, const material& m) {
         const auto& t = board->tile_draw_polygon(buf_tile, points, m.color);
         draw_tile(buf_tile, t, {.sampler = m.sampler});
     }
-    void draw_polygon(const std::string& name, std::span<const mathpls::vec2> points, const material& m) {
-        draw_polygon(get_id(name), points, m);
+    void draw_polygon(const std::string& buf_tile_name, std::span<const mathpls::vec2> points, const material& m) {
+        draw_polygon(get_id(buf_tile_name), points, m);
+    }
+    void draw_polygon(std::span<const mathpls::vec2> points, const material& m) {
+        draw_polygon(create(auto_delete), points, m);
     }
 
-    void set_camera(const camera& cam) { board->set_camera(cam); }
-
-    void submit() const { board->submit(); }
+    void submit() {
+        board->submit();
+        for (auto id : auto_delete_tiles)
+            destroy(id);
+        auto_delete_tiles.clear();
+    }
     void submit_without_clear() const { board->submit_without_clear(); }
+
+    void set_camera(const camera& cam) { board->set_camera(cam); }
 
     void draw_tile(tile id, const transform& t, const material& m = {}) { board->draw(id, t, m); }
     void draw_tile(const std::string& name, const transform& t, const material& m = {}) { board->draw(get_id(name), t, m); }
@@ -1175,6 +1360,8 @@ private:
 
     detail::dense_set<tile> ids;
     detail::dense_set<std::string> names;
+
+    std::vector<tile> auto_delete_tiles;
 };
 
 }
