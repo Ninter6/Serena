@@ -1302,7 +1302,7 @@ public:
     void draw_line(const std::string& buf_tile_name, mathpls::vec2 a, mathpls::vec2 b, float thickness, mathpls::vec4 color, bool clear_tile = true) {
         draw_line(get_id(buf_tile_name), a, b, thickness, color, clear_tile);
     }
-    void draw_line(mathpls::vec2 a, mathpls::vec2 b, float thickness, mathpls::vec4 color) {
+    void draw_line(mathpls::vec2 a, mathpls::vec2 b, float thickness, mathpls::vec4 color = {1}) {
         if (exist("__AUtO_dElEtE_whItE_blOck"))
             draw_line("__AUtO_dElEtE_whItE_blOck", a, b, thickness, color, false);
         else
